@@ -1,11 +1,7 @@
 /******************************************************************************
 * File Name:   main.c
 *
-* Description: This is the source code for the PSoC 6 MCU: Hello World Example
-*              for ModusToolbox.
-*
 * Related Document: See README.md
-*
 *
 *******************************************************************************
 * Copyright 2019-2021, Cypress Semiconductor Corporation (an Infineon company) or
@@ -60,14 +56,16 @@
 #define DEFAULT_TIMER_PERIOD			  (1)
 
 /*
- * THERMISTOR PIN CONFIG MACROS - CY8CPROTO-062-WiFi-BT kit
+ * THERMISTOR PIN CONFIG MACROS - CY8CPROTO-062-4343W kit
  */
 #define THERM_GND	P10_3
 #define THERM_VDD	P10_0
 #define THERM_OUT	P10_2
-/*ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss*/
+
+/* UART data packet length*/
 #define RX_LENGTH   5
-/*ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss*/
+
+/* Commands to control the measurement*/
 #define START_CMD	0xA0
 #define STOP_CMD	0xB0
 #define SET_CMD		0xC0
@@ -80,17 +78,16 @@ void timer_init(uint32_t sec);
 static void isr_timer(void *callback_arg, cyhal_timer_event_t event);
 float temperature(void);
 
-
 /*******************************************************************************
 * Global Variables
 *******************************************************************************/
 bool timer_interrupt_flag = false;
 bool timer_active_flag = true;
 
-/* Variable for storing character read from terminal */
+/* Variable for storing packet of bytes read from UART */
 uint8_t uart_read_value[RX_LENGTH];
 
-/* Timer object used for blinking the LED */
+/* Timer object used for blinking the LED and temperature measurement */
 cyhal_timer_t led_blink_timer;
 
 /* Thermistor globals */
@@ -109,7 +106,7 @@ mtb_thermistor_ntc_gpio_cfg_t therm_gpio_cfg=
 			 */
 
 			.r_infinity = (float)(0.1192855), //refers to resistance at infinity, ideally 0
-			.r_ref = (float)(10000)           //refres to reference resistance
+			.r_ref = (float)(10000)           //refers to reference resistance
     };
 
 /*******************************************************************************
@@ -117,10 +114,8 @@ mtb_thermistor_ntc_gpio_cfg_t therm_gpio_cfg=
 ********************************************************************************
 * Summary:
 * This is the main function for CM4 CPU. It sets up a timer to trigger a 
-* periodic interrupt. The main while loop checks for the status of a flag set 
-* by the interrupt and toggles an LED at 1Hz to create an LED blinky. The 
-* while loop also checks whether the 'Enter' key was pressed and 
-* stops/restarts LED blinking.
+* periodic interrupt in which the measurement takes place. If UART takes the right
+* value, program stops the measurement or changes the period of timer.
 *
 * Parameters:
 *  none
@@ -165,30 +160,29 @@ int main(void)
         CY_ASSERT(0);
     }
 
-    /* \x1b[2J\x1b[;H - ANSI ESC sequence for clear screen */
-///    printf("\x1b[2J\x1b[;H");
-
     printf("----------------|Temperature Measurement|----------------\r\n\n");
     
-    /* Initialize timer to toggle the LED */
+    /* Initialize timer to toggle the LED and the measurement */
     uint32_t sec = DEFAULT_TIMER_PERIOD;
     timer_init(sec);
 
+    /* ADC initialization */
     result = cyhal_adc_init(&adc_obj, THERM_OUT, NULL);
+
+    /* Thermistor GPIO initialization */
     result = mtb_thermistor_ntc_gpio_init(&mtb_thermistor_obj, &adc_obj, THERM_GND,
     									  THERM_VDD, THERM_OUT, &therm_gpio_cfg,
 										  MTB_THERMISTOR_NTC_WIRING_VIN_R_NTC_GND);
 
-
     for (;;)
     {
 
-        /* Check if 'stop' was written */
+        /* Check if data receive was successful */
         if (cyhal_uart_read_async(&cy_retarget_io_uart_obj, uart_read_value, RX_LENGTH)
              == CY_RSLT_SUCCESS)
         {
 
-            /* Check if uart is 'stop'  */
+            /* Check if command is 'stop'  */
         	if ((timer_active_flag) & (uart_read_value[0] == STOP_CMD))
         	{
 
@@ -198,11 +192,9 @@ int main(void)
 
                 printf("Measurement paused\r\n");
 
-                /* Move cursor to previous line */
-                ///printf("\x1b[1F");
              }
 
-        	/* Check if uart is 'start'  */
+        	/* Check if command is 'start'  */
         	else if ((!timer_active_flag) & (uart_read_value[0] == START_CMD))
 			{
         		cyhal_timer_start(&led_blink_timer);
@@ -210,12 +202,13 @@ int main(void)
         		timer_active_flag ^=1;
 
         		printf("Measurement resumed\r\n");
-        		///printf("\x1b[1F");
+
 			}
 
-        	/* Check if uart is 'set period'  */
+        	/* Check if command is 'set period'  */
         	else if (uart_read_value[0] == SET_CMD)
         	{
+        	    /* Data convertation to uint32_t */
         		sec = (uart_read_value[1] << 24) + (uart_read_value[2] << 16) +
         			  (uart_read_value[3] << 8) + uart_read_value[4];
 
@@ -232,14 +225,16 @@ int main(void)
 
         }
 
-        /* Check if timer elapsed (interrupt fired) and toggle the LED */
+        /* Check if timer elapsed (interrupt fired), read temperature and toggle the LED */
         if (timer_interrupt_flag)
         {
             /* Clear the flag */
             timer_interrupt_flag = false;
 
             /* Invert the USER LED state */
-            cyhal_gpio_toggle(CYBSP_USER_LED);/*вимір температури, запис, вивід на екран */
+            cyhal_gpio_toggle(CYBSP_USER_LED);
+
+            /* Temperature measurement and send to UART */
             temperature();
         }
     }
@@ -253,11 +248,11 @@ int main(void)
 * This function creates and configures a Timer object. The timer ticks 
 * continuously and produces a periodic interrupt on every terminal count 
 * event. The period is defined by the 'period' and 'compare_value' of the 
-* timer configuration structure 'led_blink_timer_cfg'. Without any changes, 
-* this application is designed to produce an interrupt every 1 second.
+* timer configuration structure 'led_blink_timer_cfg'. Default period is set to
+* 1 second.
 *
 * Parameters:
-*  none
+*  sec          period in seconds set by user
 *
 *******************************************************************************/
  void timer_init(uint32_t sec)
@@ -297,7 +292,7 @@ int main(void)
     cyhal_timer_enable_event(&led_blink_timer, CYHAL_TIMER_IRQ_TERMINAL_COUNT,
                               7, true);
 
-    /* Start the timer with the configured settings */
+    /* Start the timer with the configured settings if it is disabled*/
     if (timer_active_flag)
     {
     	cyhal_timer_start(&led_blink_timer);
